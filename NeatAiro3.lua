@@ -22,6 +22,15 @@ local TILE_BLOCK_VALUES = {
     103, 109, 107, 106, 105, 46, 116, 115,
 };
 
+local ENEMY_VALUES = {
+    0x6C, -- green koopa troopa
+    0x6D, -- red koopa troopa
+    0x6E, -- green koopa paratroopa jumpy
+    0x72, -- goomba
+    0x73, -- para goomba (red)
+    0xA0, -- green piranha plant up
+};
+
 local INPUT_RADIUS = 7;
 local INPUT_COUNT = ((INPUT_RADIUS*2 + 1) * (INPUT_RADIUS*2 + 1)) + 1;
 
@@ -99,13 +108,87 @@ local function get_tile(dx, dy)
     end
 end
 
+-- Return `true` if `raw_byte_value` is the value of a an enemy.
+-- Enemies are defined in `ENEMY_VALUES`.
+local function is_enemy(raw_byte_value)
+    for i=1, #ENEMY_VALUES do
+        if ENEMY_VALUES[i] == raw_byte_value then
+            return true
+        end
+    end
+    return false
+end
+
+-- Return array of objects `{x, y, id}`.
+-- Each object is a cell denoting a single enemy.
+local function get_enemies()
+    -- Enemy data begins at 0x7B40.
+    -- The first byte is always 1.
+    -- 
+    -- Each enemy has 3 bytes associated to it:
+    -- EnemyID, StartX, StartY.
+    -- EnemyID determines the type of enemy.
+    -- StartX and StartY are in tile cells.
+    -- 
+    -- After the last enemy on screen, a 0xFF byte follows
+    -- and then 0x00 bytes until the end of enemy buffer.
+    -- 
+    -- The positions are split into 2 values, much like
+    -- Mario's position. The game supports 5 enemies at
+    -- once (???) and their positions go in reverse order
+    -- in the RAM map. The game recycles enemy locations
+    -- by [i mod 5].
+    -- 
+    -- Enemy state is stored in 0x661 - 0x665.
+    -- if 0 => dead
+    -- if 6 => knocked by shell (flies down the screen).
+    -- if 7 => stopmed
+    -- if 8 => killed by shell (turns to dust).
+
+    local BASE_ENEMY_ID = 0x7B40 + 0x01;
+    local BASE_X_HIGH = 0x76;
+    local BASE_X_LOW = 0x91;
+    local BASE_Y_HIGH = 0x88;
+    local BASE_Y_LOW = 0xA3;
+    local BASE_ENEMY_STATE = 0x661;
+    local enemies = {};
+
+    for i = 0, 4 do
+        local addr = BASE_ENEMY_ID + i * 3;
+
+        local enemy_type = memory.readbyte(addr);
+        local x_in_page = memory.readbyte(BASE_X_LOW + (4-i) % 5);
+        local y_in_page = memory.readbyte(BASE_Y_LOW + (4-i) % 5);
+        local x_page = memory.readbyte(BASE_X_HIGH + (4-i) % 5);
+        local y_page = memory.readbyte(BASE_Y_HIGH + (4-i) % 5);
+        local state = memory.readbyte(BASE_ENEMY_STATE + (4-i) % 5);
+
+        local x = x_in_page + x_page * 256;
+        local y = y_in_page + y_page * 256;
+
+        if is_enemy(enemy_type) and (state < 6 and state > 0) then
+            enemies[#enemies + 1] = {
+                ["id"] = enemy_type,
+                ["x"] = x,
+                ["y"] = y,
+            };
+        end
+    end
+
+    return enemies;
+end
+
+
 -- Return array of integers each representing a value in the input grid.
 -- 0 is empty space, 1 is solid block, -1 is enemy. Enemies override solids.
 local function get_inputs()
     -- We fill evereything with 0 -> empty cell
-    -- For each cell, check if it's a tile, and if so, give it a value of 1
+    -- For each cell, check if it's a tile, and if so, give it a value of 1.
+    -- For each enemy, check if its on the i-th cell and if so, give it -1.
 
     local inputs = {};
+
+    local enemies = get_enemies();
 
     for cy = -INPUT_RADIUS, INPUT_RADIUS do
         for cx = -INPUT_RADIUS, INPUT_RADIUS do
@@ -113,6 +196,18 @@ local function get_inputs()
             local dx = cx * 16;
 
             inputs[#inputs + 1] = 0; -- Default cell value is 0 => nothing.
+
+            for i = 1, #enemies do
+                local enem_x = enemies[i].x - 8;
+                local enem_y = enemies[i].y;
+
+                local dist_x = math.abs(enem_x - (mario_x + dx));
+                local dist_y = math.abs(enem_y - (mario_y + dy));
+
+                if dist_x <= 8 and dist_y <= 8 then
+                    inputs[#inputs] = -1;
+                end
+            end
 
             local tile = get_tile(dx, dy);
             if tile == 1 then
@@ -188,13 +283,20 @@ local function draw()
         -- For input nodes, draw only non-zero ones.
         -- For hidden/output nodes, always draw them.
         if n > INPUT_COUNT or cell.value ~= 0 then
+            -- Determine color based on value (block/enemy)
+            local color = 0xFFFFFFFF;
+            if cell.value == -1 then
+                color = 0xFF000000;
+            end
+
+
             gui.drawBox(
                 cell.x - RENDER_NODE_SIZE/2,
                 cell.y - RENDER_NODE_SIZE/2,
                 cell.x + RENDER_NODE_SIZE/2,
                 cell.y + RENDER_NODE_SIZE/2,
                 0xFF000000,
-                0xFFFFFFFF
+                color
             );
         end
     end
