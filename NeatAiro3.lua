@@ -1,6 +1,14 @@
+-------------------------------------------------------------------------------
+--
+-- NEAT AIRO BROS 3
+-- Neuro Evolution of Augmenting Topologies for Super Mario Bros. 3
+--
+-------------------------------------------------------------------------------
+
+
 -- https://datacrystal.romhacking.net/wiki/Super_Mario_Bros._3:RAM_map
 
-local SAVESTATE_FNAME = "./SMB3_NeatAiro.State";
+local SAVESTATE_FNAME = "./SMB3_NeatAiro_lvl3.State";
 local TILE_BLOCK_VALUES = {
     0xe2, 0xe3, 0xe4, -- Blue jumpthru block
     0xa0, 0xa0, 0xa2, -- Green jumpthru block
@@ -29,11 +37,23 @@ local ENEMY_VALUES = {
     0x72, -- goomba
     0x73, -- para goomba (red)
     0xA0, -- green piranha plant up
+    0x82, -- boomerang bro
 };
+
+local BUTTONS = {
+    "A",
+    "B",
+    "Left",
+    "Right",
+}
 
 local INPUT_RADIUS = 7;
 local INPUT_COUNT = ((INPUT_RADIUS*2 + 1) * (INPUT_RADIUS*2 + 1)) + 1;
+local OUTPUT_COUNT = #BUTTONS;
 
+local MAX_NODES = 1000; -- INPUT_COUNT + OUTPUT_COUNT + hidden count
+
+local tick = 0;
 local mario_x = 0;
 local mario_y = 0;
 
@@ -167,6 +187,10 @@ local function get_enemies()
         local y = y_in_page + y_page * 256;
 
         if is_enemy(enemy_type) and (state < 6 and state > 0) then
+            if enemy_type == ENEMY_VALUES[7] then
+                y = y + 8;
+            end
+
             enemies[#enemies + 1] = {
                 ["id"] = enemy_type,
                 ["x"] = x,
@@ -181,6 +205,7 @@ end
 
 -- Return array of integers each representing a value in the input grid.
 -- 0 is empty space, 1 is solid block, -1 is enemy. Enemies override solids.
+-- **Does not** include the bias node.
 local function get_inputs()
     -- We fill evereything with 0 -> empty cell
     -- For each cell, check if it's a tile, and if so, give it a value of 1.
@@ -217,6 +242,262 @@ local function get_inputs()
     end
     return inputs;
 end
+
+-------------------------------------------------------------------------------
+-- Math
+-------------------------------------------------------------------------------
+
+-- For some reason, `math.tanh` was deprecated.
+-- http://lua-users.org/wiki/HyperbolicFunctions
+local function tanh(x)
+    if x == 0 then return 0.0 end
+    local neg = false
+    if x < 0 then x = -x; neg = true end
+    if x < 0.54930614433405 then
+      local y = x * x
+      x = x + x * y *
+          ((-0.96437492777225469787e0  * y +
+            -0.99225929672236083313e2) * y +
+            -0.16134119023996228053e4) /
+          (((0.10000000000000000000e1  * y +
+             0.11274474380534949335e3) * y +
+             0.22337720718962312926e4) * y +
+             0.48402357071988688686e4)
+    else
+      x = math.exp(x)
+      x = 1.0 - 2.0 / (x * x + 1.0)
+    end
+    if neg then x = -x end
+    return x
+  end
+
+local function sigmoid(x)
+    return tanh(x)
+end
+
+-------------------------------------------------------------------------------
+-- Data structures
+-------------------------------------------------------------------------------
+
+-- A MutationRate is a mutable record of probabilities for mutation.
+-- 1 genome <--> 1 mutation rate.
+local function MutationRate()
+    local mutation_rate = {};
+    mutation_rate.connections = 0.25;
+    mutation_rate.link = 2.0;
+    mutation_rate.bias = 0.4;
+    mutation_rate.node = 0.5;
+    mutation_rate.enable = 0.2;
+    mutation_rate.disable = 0.4;
+    mutation_rate.step = 0.1;
+
+    return mutation_rate;
+end
+
+-- Single node in a NN.
+local function Neuron()
+    local neuron = {};
+    neuron.incoming = {}; -- Incoming genes.
+    neuron.value = 0;
+
+    return neuron;
+end
+
+-- Connection between 2 neurons.
+local function Gene()
+    local gene = {};
+    gene.into = 0;
+    gene.out = 0;
+    gene.weight = 0;
+    gene.enabled = true;
+    gene.innovation = 0;
+
+    return gene;
+end
+
+-- Create deep copy of `gene`.
+local function GeneCopy(gene)
+    local new = Gene()
+	new.into = gene.into
+	new.out = gene.out
+	new.weight = gene.weight
+	new.enabled = gene.enabled
+	new.innovation = gene.innovation
+
+    return new;
+end
+
+-- A Genome is an individual competing in a population.
+local function Genome()
+    local genome = {};
+    genome.genes = {};
+    genome.fitness = 0;
+    genome.fitness_adj = 0;
+    genome.network = {};
+    genome.max_neuron = 0;
+    genome.global_rank = 0;
+    genome.mutation_rate = MutationRate();
+
+    return genome;
+end
+
+-- Create deep copy of `genome`.
+local function GenomeCopy(genome)
+    local new = Genome();
+
+    for i = 1, #genome.genes do
+        table.insert(new.genes, GeneCopy(genome.genes[i]));
+    end
+
+    for mut, rate in pairs(genome.mutation_rate) do
+        new.mutation_rate[mut] = rate;
+    end
+
+    new.genome = genome.max_neuron;
+
+    return new;
+end
+
+-- A Species is a collection of genomes grouped by similar features.
+local function Species()
+    local species = {};
+    species.genomes = {};
+    species.staleness = 0;
+    species.top_fitness = 0;
+    species.avg_fitness = 0;
+
+    return species;
+end
+
+-- A Pool is a collection of species spanning multiple generations.
+local function Pool()
+    local pool = {};
+    pool.species = {};
+    pool.generation = 0;
+    pool.innovation = OUTPUT_COUNT;
+    pool.curr_species = 1;
+    pool.curr_genome = 1;
+    pool.top_fitness = 0;
+
+    return pool;
+end
+local pool = {};
+
+-- Modifies the global pool object.
+local function new_innovation()
+    pool.innovation = pool.innovation + 1;
+    return pool.innovation;
+end
+
+-------------------------------------------------------------------------------
+-- Neural network high level functions.
+-------------------------------------------------------------------------------
+
+-- Create a network from the given `genome: Genome`.
+-- Returns the created network.
+-- You probably want `generate_network_for()` instead.
+local function Network(genome)
+    local network = {};
+    network.neurons = {};
+
+    -- Initialize all input and output neurons.
+
+    for i = 1, INPUT_COUNT do
+        network.neurons[i] = Neuron();
+    end
+    for j = 1, OUTPUT_COUNT do
+        network.neurons[MAX_NODES + j] = Neuron();
+    end
+
+    -- Sort by `out` i.e. semi-horizontal ordering.
+
+    table.sort(genome.genes,
+        function(g1, g2)
+            return (g1.out < g2.out)
+        end
+    );
+
+    -- For each enabled gene in the genome, add its neurons and connect them.
+
+    for i = 1, #genome.genes do
+        local g = genome.genes[i];
+
+        if g.enabled then
+            if network.neurons[g.out] == nil then
+                network.neurons[g.out] = Neuron();
+            end
+            table.insert(network.neurons[g.out].incoming, g);
+            if network.neurons[g.into] == nil then
+                network.neurons[g.into] = Neuron();
+            end
+        end
+    end
+
+    return network;
+end
+
+-- Given the genome, create its network.
+-- Modifies genome.
+local function generate_network_for(genome)
+    local network = Network(genome);
+    genome.network = network;
+end
+
+-- Feed `input_data` to `network` and spit out `output`.
+-- Returns a map between button names and true/false, for each button.
+--
+-- Modifies `network`: updates its input nodes to `input_data`.
+--
+-- Modifies `input_data`: adds a bias node.
+local function network_evaluate(network, input_data)
+    -- Add bias node.
+    table.insert(input_data, 1);
+
+    -- Just in case.
+    if #input_data ~= INPUT_COUNT then
+        console.writeline("Input count expected " .. INPUT_COUNT .. " got " .. #input_data);
+        return {};
+    end
+
+    -- Evaluate input layer.
+    for i = 1, INPUT_COUNT do
+        network.neurons[i].value = input_data[i];
+    end
+
+    -- Evaluate output and hidden layer.
+    for _, neuron in pairs(network.neurons) do -- `neurons` is sparse
+        local sum = 0;
+
+        for i = 1, #neuron.incoming do
+            local gene = neuron.incoming[i];
+            local neuron_in = network.neurons[gene.into];
+
+            sum = sum + gene.weight * neuron_in.value;
+        end
+
+        if #neuron.incoming > 0 then -- Do this only for non-inputs.
+            neuron.value = sigmoid(sum);
+        end
+    end
+
+    -- Evaluate game action based on network state.
+    local output_arr = {}; -- true/false for each button.
+    for i = 1, OUTPUT_COUNT do
+        local btn_name = "P1 " .. BUTTONS[i];
+
+        if network.neurons[MAX_NODES + i].value > 0 then
+            output_arr[btn_name] = true;
+        else
+            output_arr[btn_name] = false;
+        end
+    end
+
+    return output_arr;
+end
+
+-------------------------------------------------------------------------------
+-- Mutation
+-------------------------------------------------------------------------------
 
 -------------------------------------------------------------------------------
 -- Render
@@ -324,6 +605,7 @@ end
 local function on_update()
     update_player_position();
     get_inputs();
+
     draw();
 end
 
@@ -331,5 +613,6 @@ on_create();
 while true do
     on_update();
 
+    tick = tick + 1;
     emu.frameadvance();
 end
