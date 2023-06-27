@@ -58,6 +58,9 @@ local tick = 0;
 local mario_x = 0;
 local mario_y = 0;
 
+local timeout = 20;
+local rightmost = 0;
+
 local form = forms.newform(400, 100, "Neat Airo Bros. 3");
 local form_show_network = forms.checkbox(form, "Show Network", 6, 12);
 
@@ -794,6 +797,467 @@ local function mutate(genome)
 end
 
 -------------------------------------------------------------------------------
+-- Speciation
+-------------------------------------------------------------------------------
+
+
+-- Return D / N, where D is the number of disjoint genes between `genes1` and
+-- `genes2` and N is the greater number of genes in the larger of the two.
+-- This includes both pure disjoint and excess genes.
+local function get_disjoint_factor(genes1, genes2)
+    local innovation1 = {};
+    for i = 1, #genes1 do
+        innovation1[genes1[i].innovation] = true;
+    end
+    local innovation2 = {};
+    for i = 1, #genes2 do
+        innovation2[genes2[i].innovation] = true;
+    end
+
+    local D = 0;
+    for i = 1, #genes1 do
+        local gene = genes1[i];
+        if not innovation2[gene.innovation] then
+            D = D + 1;
+        end
+    end
+
+    for i = 1, #genes2 do
+        local gene = genes2[i];
+        if not innovation1[gene.innovation] then
+            D = D + 1;
+        end
+    end
+
+    local N = math.max(#genes1, #genes2);
+    return D / N;
+end
+
+-- Return avg(W), where W is an array of weight differences between each pair of 
+-- genes present both in `genes1` and `genes2`.
+local function get_average_weight_differente(genes1, genes2)
+    local innovation2_invmap = {};
+    for i = 1, #genes2 do
+        innovation2_invmap[genes2[i].innovation] = genes2[2];
+    end
+
+    local sum = 0;
+    local n = 0;
+
+    for i = 1, #genes1 do
+        local g1 = genes1[i];
+
+        if innovation2_invmap[g1.innovation] ~= nil then
+            local g2 = innovation2_invmap[g1.innovation];
+
+            sum = sum + math.abs(g1.weight - g2.weight);
+            n = n + 1;
+        end
+    end
+
+    return sum / n;
+end
+
+-- Return `true` if `genome1` and `genome2` are likely from the same species.
+local function are_of_same_species(genome1, genome2)
+    local d = 2.0 * get_disjoint_factor(genome1.genes, genome2.genes);
+    local w = 0.8 * get_average_weight_differente(genome1.genes, genome2.genes);
+    local distance_measure = d + w;
+    return distance_measure < 1.0;
+end
+
+-------------------------------------------------------------------------------
+-- Fitness
+-------------------------------------------------------------------------------
+
+-- Globally rank genomes in `species_list` by fitness (i.e. between species).
+-- Smaller rank = smaller fitness.
+--
+-- Modifies `global_rank` for each genome.
+local function set_global_rank(species_list)
+    local genomes = {};
+    for i = 1, #species_list do
+        local species = species_list[i];
+        for j = 1, #species.genomes do
+            table.insert(genomes, species.genomes[j]);
+        end
+    end
+
+    table.sort(genomes,
+        function (g1, g2)
+            return g1.fitness < g2.fitness
+        end
+    );
+
+    for i = 1, #genomes do
+        genomes[i].global_rank = i;
+    end
+end
+
+
+-- Calculate average **global** fitness within the given species.
+-- Modifies `species`.
+local function calc_avg_fitness(species)
+    local sum = 0;
+    for i = 1, #species.genomes do
+        sum = sum + species.genomes[i].global_rank;
+    end
+
+    species.avg_fitness = sum / #species.genomes;
+end
+
+-- Return sum of average fitness of each species in `pool`.
+local function get_sum_avg_fitness()
+    local sum = 0;
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+        sum = sum + species.avg_fitness;
+    end
+    return sum;
+end
+
+-------------------------------------------------------------------------------
+-- Reproduction
+-------------------------------------------------------------------------------
+
+-- Perform crossing over between two genomes. You probably don't want to use this
+-- function directly. See `get_new_child`
+--
+-- **Params:** `g1, g2: Genome` - the two genomes.
+--
+-- **Returns:** `Genome` - a child genome.
+--
+-- **Side effects:** None
+local function crossover(g1, g2)
+    if g2.fitness > g1.fitness then
+        return crossover(g2, g1);
+    end
+
+    local child = Genome();
+
+    local innovations_g2_invmap = {};
+    for i = 1, #g2.genes do
+        local gene = g2.genes[i];
+        innovations_g2_invmap[gene.innovation] = gene;
+    end
+
+    -- Take g1's superior genes unless g2 wins the 50% lottery per active gene.
+
+    for i = 1, #g1.genes do
+        local gene1 = g1.genes[i];
+        local gene2 = innovations_g2_invmap[gene1.innovation];
+
+		if gene2 ~= nil and gene2.enabled and math.random(2) == 1 then
+			table.insert(child.genes, GeneCopy(gene2))
+		else
+			table.insert(child.genes, GeneCopy(gene1))
+		end
+    end
+
+    -- Take g1's mutation rates.
+
+    for mut, rate in pairs(g1.mutation_rate) do
+        child.mutation_rate[mut] = rate;
+    end
+
+    child.max_neuron = math.max(g1.max_neuron, g2.max_neuron);
+
+    return child;
+end
+
+-- Select 2 randome genomes from the species and return a child (mutated).
+--
+-- **Params:** `species: Species`
+-- 
+-- **Returns:** `Genome* - a mutated child
+--
+-- **Side effects:** None 
+local function get_new_child(species)
+    local child = {};
+
+    local g1 = species.genomes[math.random(1, #species.genomes)];
+    local g2 = species.genomes[math.random(1, #species.genomes)];
+
+    if math.random() < 0.9 then
+        child = crossover(g1, g2);
+    else
+        child = GenomeCopy(g1);
+    end
+
+    mutate(child);
+
+    return child;
+end
+
+-- Purge bottom half of genomes in each species in `pool`.
+--
+-- **Params:** None. The global object `pool` is used.
+-- 
+-- **Returns:** Nothing.
+--
+-- **Side effects:** `species.genomes` is sorted by fitness and `species.genomes`
+-- is sliced.
+local function purge_half_in_each_species()
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+
+        table.sort(species.genomes,
+            function (g1, g2)
+                return (g1.fitness > g2.fitness)
+            end
+        );
+
+        local n = math.ceil(#species.genomes / 2);
+
+        while #species.genomes > n do
+            table.remove(species.genomes);
+        end
+    end
+end
+
+-- Purge allo genomes except the fittest one in each species.
+--
+-- **Params:** None. The global object `pool` is used.
+-- 
+-- **Returns:** Nothing.
+--
+-- **Side effects:** `species.genomes` is sorted by fitness and `species.genomes`
+-- is sliced.
+local function purge_all_but_best_in_each_species()
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+
+        table.sort(species.genomes,
+            function (g1, g2)
+                return (g1.fitness > g2.fitness)
+            end
+        );
+
+        while #species.genomes > 1 do
+            table.remove(species.genomes);
+        end
+    end
+end
+
+-- Remove all "stale" species.
+-- A species is stale if its fittest genome is less fit than the previously 
+-- recorded top fitness for that species, for K generations.
+-- Modifies `pool`.
+--
+-- Pre-condition: genomes in each species are ranked.  
+local function purge_stale_species()
+    local non_stale = {};
+
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+
+        table.sort(species.genomes,
+            function (a,b)
+			    return (a.fitness > b.fitness)
+            end
+        );
+
+        if species.genomes[1].fitness > species.top_fitness then
+            species.top_fitness = species.genomes[1].fitness;
+            species.staleness = 0;
+        else
+            species.staleness = species.staleness + 1;
+        end
+
+        if species.staleness < 3 or species.top_fitness >= pool.top_fitness then
+            table.insert(non_stale, species);
+        end
+    end
+
+    pool.species = non_stale;
+end
+
+-- Remove all "weak" species.
+-- A species is weak if its average fitness is less than the expected average
+-- fitness (the limit of the average fitness for the given population size).
+-- Modifies `pool`.
+local function purge_weak_species()
+    local non_weak = {};
+
+    local sum_avg = get_sum_avg_fitness();
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+
+        -- On average this should always be equal to 1.
+        local b = math.floor(species.avg_fitness / sum_avg * POPULATION);
+
+        if b >= 1 then
+            table.insert(non_weak, species);
+        end
+    end
+
+    pool.species = non_weak;
+end
+
+-- Add child to most suitable species.
+-- If no such species exists, create new one.
+-- Modifies `pool`.
+local function add_child_to_some_species(child)
+    local found_suitable_species = false;
+
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+        if are_of_same_species(child, species.genomes[1]) then
+            table.insert(species.genomes, child);
+            found_suitable_species = true;
+            break;
+        end
+    end
+
+    if not found_suitable_species then
+        local species = Species();
+        table.insert(species.genomes, child);
+        table.insert(pool.species, species);
+    end
+end
+
+-- Create new generation.
+-- Modifies `pool`.
+local function new_generation()
+    -- Remove weak genomes and species.
+
+    purge_half_in_each_species();
+    set_global_rank(pool.species);
+
+    purge_stale_species();
+    set_global_rank(pool.species);
+
+    for i = 1, #pool.species do
+        calc_avg_fitness(pool.species[i]);
+    end
+    purge_weak_species();
+    
+    -- Breed
+
+    local new_children = {};
+    local total_avg = get_sum_avg_fitness();
+
+    for i = 1, #pool.species do
+        local species = pool.species[i];
+
+        local n = math.floor(species.avg_fitness / total_avg * POPULATION) - 1;
+
+        for i = 1, n do
+            table.insert(new_children, get_new_child(species));
+        end
+    end
+
+    -- New population = children + some many of fittest genome in each species.
+
+    purge_all_but_best_in_each_species();
+
+    while #new_children + #pool.species < POPULATION do
+        local species = pool.species[math.random(1, #pool.species)];
+        table.insert(new_children, get_new_child(species));
+    end
+
+    -- Add children to pool.
+
+    for i = 1, #new_children do
+        local child = new_children[i];
+        add_child_to_some_species(child);
+    end
+
+    pool.generation = pool.generation + 1;
+end
+
+-------------------------------------------------------------------------------
+-- Pool initialization.
+-------------------------------------------------------------------------------
+
+local function init_pool()
+    pool = Pool();
+
+    for i = 1, POPULATION do
+        local genome = Genome();
+        mutate(genome);
+        genome.max_neuron = INPUT_COUNT;
+
+        add_child_to_some_species(genome);
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Performing actions.
+-------------------------------------------------------------------------------
+
+-- Unpress all buttons.
+local function clear_buttons()
+	local buttons = {};
+	for b = 1,#BUTTONS do
+		buttons["P1 " .. BUTTONS[b]] = false;
+	end
+	joypad.set(buttons);
+end
+
+-- Press buttons based on the current genome's reaction to the environment.
+local function perform_actions_for_current_genome()
+    local g = pool.species[pool.curr_species].genomes[pool.curr_genome];
+    local inputs = get_inputs();
+    local outputs = network_evaluate(g.network, inputs);
+
+    joypad.set(outputs);
+end
+
+-- Called when the next genome is ready to act.
+local function begin_genome_actions()
+    savestate.load(SAVESTATE_FNAME);
+    tick = 0;
+    timeout = 20;
+    rightmost = 0;
+    clear_buttons();
+
+    local g = pool.species[pool.curr_species].genomes[pool.curr_genome];
+    generate_network_for(g);
+    perform_actions_for_current_genome();
+end
+
+-- Move to next genome or species or generation (if needed).
+local function next_genome()
+    pool.curr_genome = pool.curr_genome + 1;
+    if pool.curr_genome > #pool.species[pool.curr_species].genomes then
+        pool.curr_species = pool.curr_species + 1;
+        pool.curr_genome = 1;
+
+        if pool.curr_species > #pool.species then
+            new_generation();
+            pool.curr_species = 1;
+        end
+    end
+end
+
+-- Return true if the current genome is already done playing.
+local function is_fitness_measured_for_current_genome()
+    local g = pool.species[pool.curr_species].genomes[pool.curr_genome];
+    return g.fitness ~= 0;
+end
+
+-- If you're not making progress for too long, evalute this genome and move
+-- on to the next one.
+local function finish_genome()
+    local g = pool.species[pool.curr_species].genomes[pool.curr_genome];
+
+    -- Calculate fitness.
+
+    local fitness = rightmost - (tick / 2) + 1000;
+    if fitness == 0 then
+        fitness = -1;
+    end
+
+    -- Set fitness.
+
+    g.fitness = fitness;
+    if fitness > pool.top_fitness then
+        pool.top_fitness = fitness;
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Render
 -------------------------------------------------------------------------------
 
@@ -893,16 +1357,44 @@ end
 -------------------------------------------------------------------------------
 
 local function on_create()
-    savestate.load(SAVESTATE_FNAME);
+    init_pool();
+    begin_genome_actions();
 end
 
 local function on_update()
     update_player_position();
-    get_inputs();
+    perform_actions_for_current_genome();
+
+    -- Graphics
 
     gui.clearGraphics();
     if forms.ischecked(form_show_network) then
         draw();
+    end
+
+    -- Calculate x-progress
+
+    if mario_x > rightmost then
+        rightmost = mario_x;
+        timeout = 20;
+    else
+        timeout = timeout - 1;
+    end
+
+    -- Is this genome done?
+
+    local timeout_bonus = tick / 4;
+    if timeout + timeout_bonus <= 0 then
+        finish_genome();
+
+        -- Find next genome.
+        pool.curr_species = 1;
+        pool.curr_genome = 1;
+
+        while is_fitness_measured_for_current_genome() do
+            next_genome();
+        end
+        begin_genome_actions();
     end
 end
 

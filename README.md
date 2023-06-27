@@ -8,4 +8,4 @@ How to run:
 - open the BizHawk emulator
 - open your legally obtained Super Mario Bros. 3 Rom file
 - load the script: `Tools > Lua Console > Open Script > NeatAiro3.lua`
-- create a savestate called `SMB3_NeatAiro.State` in the same folder `NeatAiro3.lua` is in (do this just once)
+- create a savestate called `SMB3_NeatAiro_lvl3.State` in the same folder `NeatAiro3.lua` is in (do this just once)
