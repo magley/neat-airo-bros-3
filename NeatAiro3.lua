@@ -57,6 +57,9 @@ local tick = 0;
 local mario_x = 0;
 local mario_y = 0;
 
+local form = forms.newform(400, 100, "Neat Airo Bros. 3");
+local form_show_network = forms.checkbox(form, "Show Network", 6, 12);
+
 -------------------------------------------------------------------------------
 -- Mario 3 RAM-related functions (network input layer).
 -------------------------------------------------------------------------------
@@ -606,10 +609,18 @@ local function on_update()
     update_player_position();
     get_inputs();
 
-    draw();
+    gui.clearGraphics();
+    if forms.ischecked(form_show_network) then
+        draw();
+    end
+end
+
+local function on_exit()
+    forms.destroy(form)
 end
 
 on_create();
+event.onexit(on_exit);
 while true do
     on_update();
 
