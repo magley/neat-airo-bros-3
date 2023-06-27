@@ -47,11 +47,12 @@ local BUTTONS = {
     "Right",
 }
 
-local INPUT_RADIUS = 7;
+local INPUT_RADIUS = 5;
 local INPUT_COUNT = ((INPUT_RADIUS*2 + 1) * (INPUT_RADIUS*2 + 1)) + 1;
 local OUTPUT_COUNT = #BUTTONS;
 
 local MAX_NODES = 1000; -- INPUT_COUNT + OUTPUT_COUNT + hidden count
+local POPULATION = 50;
 
 local tick = 0;
 local mario_x = 0;
@@ -386,7 +387,7 @@ local function Pool()
 end
 local pool = {};
 
--- Modifies the global pool object.
+-- Increments the innovation. Modifies the global pool object.
 local function new_innovation()
     pool.innovation = pool.innovation + 1;
     return pool.innovation;
@@ -396,9 +397,16 @@ end
 -- Neural network high level functions.
 -------------------------------------------------------------------------------
 
--- Create a network from the given `genome: Genome`.
--- Returns the created network.
--- You probably want `generate_network_for()` instead.
+-- Create a network from the given genome.
+--
+-- **Params:** `genome: Genome` - the individual from which to make a network.
+--
+-- **Returns:** the created network.
+--
+-- **Side effects:** `genome.genes` are sorted by `out`.
+--
+-- You probably want `generate_network_for()` because that one does in-place
+-- modification.
 local function Network(genome)
     local network = {};
     network.neurons = {};
@@ -439,8 +447,13 @@ local function Network(genome)
     return network;
 end
 
--- Given the genome, create its network.
--- Modifies genome.
+-- Create and assign the network from the given genome.
+--
+-- **Params:** `genome: Genome` - the individual from which to make a network.
+--
+-- **Returns:** Nothing
+--
+-- **Side effects:** `genome.network` is set to the newly-made network.
 local function generate_network_for(genome)
     local network = Network(genome);
     genome.network = network;
@@ -452,6 +465,17 @@ end
 -- Modifies `network`: updates its input nodes to `input_data`.
 --
 -- Modifies `input_data`: adds a bias node.
+
+-- Feed input data to the network and generate an appropriate output using the
+-- neural network.
+--
+-- **Params:** `network: Network` - the neural network used to evaluate.
+-- `input_data: array[int]` - input layer as an array (without the bias node).
+--
+-- **Returns:** `table[btn_name, bool]` - mappable to BizHawk buttons
+--
+-- **Side effects**: `input_data` is given a bias node
+-- `network.neurons[i].value` is modified
 local function network_evaluate(network, input_data)
     -- Add bias node.
     table.insert(input_data, 1);
@@ -501,6 +525,273 @@ end
 -------------------------------------------------------------------------------
 -- Mutation
 -------------------------------------------------------------------------------
+
+-- Get a random neuron from all possible neurons.
+--
+-- **Params:** `genes: array[Gene]` - array of genes from the network.
+-- `exclude_input: bool` - whether to exclude the input layer from the sample.
+--
+-- **Returns:** - integer representing a neuron ID.
+--
+-- **Side effects:** - None
+-- 
+local function get_random_neuron(genes, exclude_input)
+    local neurons = {};
+
+    -- Mark input neurons as "gettable" (unless excluded).
+    if not exclude_input then
+        for i = 1, INPUT_COUNT do
+            neurons[i] = true;
+        end
+    end
+
+    -- Mark output neurons as "gettable".
+    for i = 1, OUTPUT_COUNT do
+        neurons[MAX_NODES + i] = true;
+    end
+
+    -- Mark genes' adjacent neurons as "gettable" unless they're excluded.
+    for i = 1, #genes do
+        if (not exclude_input) or genes[i].into > INPUT_COUNT then
+            neurons[genes[i].into] = true;
+        end
+        if (not exclude_input) or genes[i].out > INPUT_COUNT then
+            neurons[genes[i].out] = true;
+        end
+    end
+
+    -- Count unique elements.
+
+    local cnt = 0;
+    for _, _ in pairs(neurons) do
+        cnt = cnt + 1;
+    end
+
+    -- Select a random number.
+
+    local index = math.random(1, cnt);
+
+    -- Since `neurons` isn't a sequence, exhaust 'index' and get last element.
+
+    for k, v in pairs(neurons) do
+        index = index - 1;
+        if index == 0 then
+            return k;
+        end
+    end
+
+    return 0;
+end
+
+-- **Params:** `genes: array[Gene]`
+-- `into, out: int`
+--
+-- **Returns:** `true` if a gene connectiong `into` to `out` exists, else `false`.
+--
+-- **Side effects:** None
+local function gene_exists(genes, into, out)
+    for i = 1, #genes do
+        if genes[i].into == into and genes[i].out == out then
+            return true;
+        end
+    end
+
+    return false;
+end
+
+-- **Params:** `genome: Genome`
+--
+-- **Returns:** Nothing
+--
+-- **Side effects:** Changes `genome.mutation_rate_*`.
+local function mutate_gene_weights(genome)
+    local step = genome.mutation_rate.step;
+
+    for i = 1, #genome.genes do
+        local gene = genome.genes[i];
+        if math.random() < 0.9 then
+            gene.weight = gene.weight + math.random() * (step * 2) - step;
+        else
+            gene.weight = math.random() * 4 - 2;
+        end
+    end
+end
+
+-- Create a gene between two random neurons in the genome.
+--
+-- **Params:** `genome: Genome`
+-- `connect_from_bias: bool` if `true`, the input node will always be the bias.
+--
+-- **Returns:** Nothing
+--
+-- **Side effects:** `genome.genes` *may* get a new gene.
+--
+-- **Note:** Won't do anything if RNG gets 2 input neurons or tries to make a
+-- gene that already exists. 
+local function mutate_connect_two_neurons(genome, connect_from_bias)
+    local n1 = get_random_neuron(genome.genes, false);
+    local n2 = get_random_neuron(genome.genes, true);
+
+    local g = Gene();
+
+    if n1 <= INPUT_COUNT and n2 <= INPUT_COUNT then
+        -- Both neurons are inputs. Whoops!
+        return;
+    end
+
+    if n2 <= INPUT_COUNT then
+        -- n2 is input, for convenience we'll swap them so that n1 is the input
+        -- neuron and n2 is the non-input neuron.
+        local temp = n1;
+        n1 = n2;
+        n2 = temp;
+    end
+
+    g.into = n1;
+    g.out = n2;
+
+    if connect_from_bias then
+        g.into = INPUT_COUNT;
+    end
+
+    if gene_exists(genome.genes, g.into, g.out) then
+        -- This gene already exists. Whoops!
+        return;
+    end
+
+    g.innovation = new_innovation();
+    g.weight = math.random() * 4 - 2;
+
+    table.insert(genome.genes, g);
+end
+
+-- Split existing randomly selected gene into two. Creates a new neuron. The
+-- first gene will have a weight of 1. The *old* gene is disabled.
+--
+-- **Params:** `genome: Genome`
+--
+-- **Returns:** Nothing
+--
+-- **Side effects:** `genome.genes` *may* get 2 new genes. The old gene *may*
+-- become disabled. `genome.max_neuron` is incremented (it's the new neuron).
+--
+-- **Note:** Won't do anything if the RNG selected gene is disabled. 
+local function mutate_split_gene(genome)
+    if #genome.genes == 0 then
+        return;
+    end
+
+    genome.max_neuron = genome.max_neuron + 1; -- TODO: After next return?
+
+    local g = genome.genes[math.random(1, #genome.genes)];
+    if not g.enabled then
+        return;
+    end
+    g.enabled = false;
+
+    local g1 = GeneCopy(g); -- First half of old `g`.
+    g1.out = genome.max_neuron;
+    g1.weight = 1;
+    g1.innovation = new_innovation();
+    g1.enabled = true;
+
+    local g2 = GeneCopy(g); -- Second half of old `g`.
+    g2.into = genome.max_neuron;
+    g2.innovation = new_innovation();
+    g2.enabled = true;
+
+    table.insert(genome.genes, g1);
+    table.insert(genome.genes, g2);
+end
+
+-- Toggle single enabled gene to disabled or disabled to enabled.
+--
+-- **Params:** `genome: Genome`
+-- `old_enabled_status: bool` if `true`, this function will try to disable an
+-- enabled gene. 
+--
+-- **Returns:** Nothing
+--
+-- **Side effects:** `genome.genes[k].enabled` may flip.
+--
+-- **Note:** Won't do anything if there are no enabled/disabled genes.
+local function mutate_flip_enabled_flag_of_a_gene(genome, old_enabled_status)
+    local genes = {};
+    for _, gene in pairs(genome.genes) do
+        if gene.enabed == old_enabled_status then
+            table.insert(genes, gene);
+        end
+    end
+
+    if #genes == 0 then
+        return;
+    end
+
+    local gene = genes[math.random(1, #genes)];
+    gene.enabled = not gene.enabled;
+end
+
+-- Mutates the genome using all available mutation methods.
+--
+-- **Params:** `genome: Genome`
+--
+-- **Returns:** Nothing
+--
+-- **Side effects:** `genome` is modified in various ways.
+local function mutate(genome)
+    -- Perturbate mutation rates.
+	for mutation,rate in pairs(genome.mutation_rate) do
+		if math.random(1,2) == 1 then
+			genome.mutation_rate[mutation] = 0.95 * rate
+		else
+			genome.mutation_rate[mutation] = 1.05263 * rate
+		end
+	end
+
+    if math.random() < genome.mutation_rate.connections then
+        mutate_gene_weights(genome);
+    end
+
+    local p = genome.mutation_rate.link;
+    while p > 0 do
+        if math.random() < p then
+            mutate_connect_two_neurons(genome, false);
+        end
+        p = p - 1;
+    end
+
+    p = genome.mutation_rate.bias;
+    while p > 0 do
+        if math.random() < p then
+            mutate_connect_two_neurons(genome, true);
+        end
+        p = p - 1;
+    end
+
+    p = genome.mutation_rate.node;
+    while p > 0 do
+        if math.random() < p then
+            mutate_split_gene(genome);
+        end
+        p = p - 1;
+    end
+
+    p = genome.mutation_rate.enable;
+    while p > 0 do
+        if math.random() < p then
+            mutate_flip_enabled_flag_of_a_gene(genome, true);
+        end
+        p = p - 1;
+    end
+
+    p = genome.mutation_rate.disable;
+    while p > 0 do
+        if math.random() < p then
+            mutate_flip_enabled_flag_of_a_gene(genome, false);
+        end
+        p = p - 1;
+    end
+end
 
 -------------------------------------------------------------------------------
 -- Render
