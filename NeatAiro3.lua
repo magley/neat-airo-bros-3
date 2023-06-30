@@ -8,7 +8,8 @@
 
 -- https://datacrystal.romhacking.net/wiki/Super_Mario_Bros._3:RAM_map
 
-local SAVESTATE_FNAME = "./SMB3_NeatAiro_lvl3.State";
+local SAVESTATE_FNAME_BASE = "SMB3_NeatAiro_lvl3.State";
+local SAVESTATE_FNAME = "./" .. SAVESTATE_FNAME_BASE;
 local TILE_BLOCK_VALUES = {
     0xe2, 0xe3, 0xe4, -- Blue jumpthru block
     0xa0, 0xa0, 0xa2, -- Green jumpthru block
@@ -61,8 +62,6 @@ local mario_y = 0;
 local timeout = 20;
 local rightmost = 0;
 
-local form = forms.newform(400, 100, "Neat Airo Bros. 3");
-local form_show_network = forms.checkbox(form, "Show Network", 6, 12);
 
 -------------------------------------------------------------------------------
 -- Mario 3 RAM-related functions (network input layer).
@@ -388,12 +387,28 @@ local function Pool()
 
     return pool;
 end
-local pool = {};
+local pool = Pool();
 
 -- Increments the innovation. Modifies the global pool object.
 local function new_innovation()
     pool.innovation = pool.innovation + 1;
     return pool.innovation;
+end
+
+
+-------------------------------------------------------------------------------
+-- Form [01]
+-------------------------------------------------------------------------------
+
+
+local form = forms.newform(400, 250, "Neat Airo Bros. 3");
+local form_show_network = forms.checkbox(form, "Show Network", 6, 12);
+local form_filename = forms.textbox(form, SAVESTATE_FNAME_BASE .. ".pool", 300, 48, nil, 6, 48);
+local form_best_fitness = forms.label(form, "Best fitness: " .. math.floor(pool.top_fitness), 8, 128);
+
+
+local function update_form()
+    forms.settext(form_best_fitness, "Best fitness: " .. math.floor(pool.top_fitness));
 end
 
 -------------------------------------------------------------------------------
@@ -1206,6 +1221,8 @@ end
 
 -- Called when the next genome is ready to act.
 local function begin_genome_actions()
+    update_form();
+
     savestate.load(SAVESTATE_FNAME);
     tick = 0;
     timeout = 20;
@@ -1244,7 +1261,7 @@ local function finish_genome()
 
     -- Calculate fitness.
 
-    local fitness = rightmost - (tick / 2) + 1000;
+    local fitness = rightmost * 4 - (tick / 4) + 1000;
     if fitness == 0 then
         fitness = -1;
     end
@@ -1256,6 +1273,156 @@ local function finish_genome()
         pool.top_fitness = fitness;
     end
 end
+
+local function play_best_genome()
+    local max_fitness = 0;
+    local max_species = -1;
+    local max_genome = -1;
+
+    -- Find best genome and species it belongs to.
+
+    for s, species in pairs(pool.species) do
+        for g, genome in pairs(species.genomes) do
+            if genome.fitness > max_fitness then
+                max_fitness = genome.fitness;
+                max_species = s;
+                max_genome = g;
+            end
+        end
+    end
+
+    pool.curr_genome = max_genome;
+    pool.curr_species = max_species;
+    pool.top_fitness = max_fitness;
+    begin_genome_actions();
+    tick = tick + 1;
+end
+
+
+-------------------------------------------------------------------------------
+-- File I/O
+-------------------------------------------------------------------------------
+
+-- You probably want `save_pool()`.
+local function save_pool_to(fname)
+    local file = io.open(fname, "w");
+
+    if file ~= nil then
+        file:write(pool.generation .. "\n");
+        file:write(pool.top_fitness .. "\n");
+        file:write(#pool.species .. "\n");
+        
+        for _, species in pairs(pool.species) do
+            file:write(species.top_fitness .. "\n");
+            file:write(species.staleness .. "\n");
+            file:write(#species.genomes .. "\n");
+
+            for _, genome in pairs(species.genomes) do
+                file:write(genome.fitness .. "\n");
+                file:write(genome.max_neuron .. "\n");
+                for mut, rate in pairs(genome.mutation_rate) do
+                    file:write(mut .. "\n");
+                    file:write(rate .. "\n");
+                end
+                file:write("done\n");
+                file:write(#genome.genes .. "\n");
+
+                for _, gene in pairs(genome.genes) do
+                    file:write(gene.into .. "\n");
+                    file:write(gene.out .. "\n");
+                    file:write(gene.weight .. "\n");
+                    file:write(gene.innovation .. "\n");
+                    if gene.enabled then
+                        file:write("1\n");
+                    else
+                        file:write("0\n");
+                    end
+                end
+            end
+        end
+        file:close();
+    else
+        console.writeline("Could not open file " .. fname);
+    end
+end
+
+local function load_pool_from(fname)
+    local f = io.open(fname, "r");
+
+    if f ~= nil then
+        pool = Pool();
+        pool.generation = f:read("*number");
+        pool.top_fitness = f:read("*number");
+
+        local species_n = f:read("*number");
+        for i = 1, species_n do
+            local species = Species();
+            table.insert(pool.species, species);
+            species.top_fitness = f:read("*number");
+            species.staleness = f:read("*number");
+
+            local genomes_n = f:read("*number");
+            for j = 1, genomes_n do
+                local genome = Genome();
+                table.insert(species.genomes, genome);
+
+                genome.fitness = f:read("*number");
+                genome.max_neuron = f:read("*number");
+
+                local l = f:read("*line");
+                while l ~= "done" do
+                    genome.mutation_rate[l] = f:read("*number");
+                    l = f:read("*line");
+                end
+
+                local genes_n = f:read("*number");
+                for k = 1, genes_n do
+                    local gene = Gene();
+                    table.insert(genome.genes, gene);
+
+                    local enabled;
+                    gene.into, gene.out, gene.weight, gene.innovation, enabled = f:read("*number", "*number", "*number", "*number", "*number");
+
+                    if enabled == 0 then
+                        gene.enabled = false;
+                    else
+                        gene.enabled = true;
+                    end
+                end
+            end
+        end
+
+        f:close();
+
+        while is_fitness_measured_for_current_genome() do
+            next_genome();
+        end
+        begin_genome_actions();
+    else
+        console.writeline("Could not open file " .. fname);
+    end
+end
+
+local function save_pool()
+    local fname = forms.gettext(form_filename);
+    save_pool_to(fname);
+end
+
+local function load_pool()
+    local fname = forms.getfname(form_filename);
+    load_pool_from(fname);
+end
+
+
+-------------------------------------------------------------------------------
+-- Form [02]
+-------------------------------------------------------------------------------
+
+
+local form_save = forms.button(form, "Save to fname", save_pool, 8, 80);
+local form_load = forms.button(form, "Load from fname", load_pool, 124, 80);
+local form_play_best = forms.button(form, "Replay best genome", play_best_genome, 8, 104);
+
 
 -------------------------------------------------------------------------------
 -- Render
