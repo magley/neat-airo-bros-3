@@ -8,8 +8,24 @@
 
 -- https://datacrystal.romhacking.net/wiki/Super_Mario_Bros._3:RAM_map
 
-local SAVESTATE_FNAME_BASE = "SMB3_NeatAiro_lvl3.State";
-local SAVESTATE_FNAME = "./" .. SAVESTATE_FNAME_BASE;
+local k = 0;
+local SAVESTATE_FNAME1_BASE = "SMB3_NeatAiro.State";
+local SAVESTATE_FNAME2_BASE = "SMB3_NeatAiro_s2.State";
+local SAVESTATE_FNAME = "./" .. SAVESTATE_FNAME1_BASE;
+local SAVESTATE_FNAME_BASE = SAVESTATE_FNAME;
+
+local function set_savestate_fname()
+    if k % 20 == 0 then
+        if SAVESTATE_FNAME == "./" .. SAVESTATE_FNAME1_BASE then
+            SAVESTATE_FNAME = "./" .. SAVESTATE_FNAME2_BASE;
+        else
+            SAVESTATE_FNAME = "./" .. SAVESTATE_FNAME1_BASE;
+        end
+    end
+
+    SAVESTATE_FNAME_BASE = SAVESTATE_FNAME;
+end
+
 local TILE_BLOCK_VALUES = {
     0xe2, 0xe3, 0xe4, -- Blue jumpthru block
     0xa0, 0xa0, 0xa2, -- Green jumpthru block
@@ -48,7 +64,7 @@ local BUTTONS = {
     "Right",
 }
 
-local INPUT_RADIUS = 5;
+local INPUT_RADIUS = 7;
 local INPUT_COUNT = ((INPUT_RADIUS*2 + 1) * (INPUT_RADIUS*2 + 1)) + 1;
 local OUTPUT_COUNT = #BUTTONS;
 
@@ -61,6 +77,8 @@ local mario_y = 0;
 
 local timeout = 20;
 local rightmost = 0;
+
+
 
 
 -------------------------------------------------------------------------------
@@ -290,11 +308,11 @@ end
 local function MutationRate()
     local mutation_rate = {};
     mutation_rate.connections = 0.25;
-    mutation_rate.link = 2.0;
-    mutation_rate.bias = 0.4;
-    mutation_rate.node = 0.5;
-    mutation_rate.enable = 0.2;
-    mutation_rate.disable = 0.4;
+    mutation_rate.link = 3.0;
+    mutation_rate.bias = 1.4;
+    mutation_rate.node = 1.5;
+    mutation_rate.enable = 1.2;
+    mutation_rate.disable = 1.4;
     mutation_rate.step = 0.1;
 
     return mutation_rate;
@@ -876,7 +894,7 @@ end
 -- Return `true` if `genome1` and `genome2` are likely from the same species.
 local function are_of_same_species(genome1, genome2)
     local d = 2.0 * get_disjoint_factor(genome1.genes, genome2.genes);
-    local w = 0.8 * get_average_weight_differente(genome1.genes, genome2.genes);
+    local w = 0.4 * get_average_weight_differente(genome1.genes, genome2.genes);
     local distance_measure = d + w;
     return distance_measure < 1.0;
 end
@@ -993,7 +1011,7 @@ local function get_new_child(species)
     local g1 = species.genomes[math.random(1, #species.genomes)];
     local g2 = species.genomes[math.random(1, #species.genomes)];
 
-    if math.random() < 0.9 then
+    if math.random() < 0.75 then
         child = crossover(g1, g2);
     else
         child = GenomeCopy(g1);
@@ -1079,7 +1097,7 @@ local function purge_stale_species()
             species.staleness = species.staleness + 1;
         end
 
-        if species.staleness < 3 or species.top_fitness >= pool.top_fitness then
+        if species.staleness < 5 or species.top_fitness >= pool.top_fitness then
             table.insert(non_stale, species);
         end
     end
@@ -1221,6 +1239,8 @@ end
 
 -- Called when the next genome is ready to act.
 local function begin_genome_actions()
+    k = k + 1;
+    set_savestate_fname();
     update_form();
 
     savestate.load(SAVESTATE_FNAME);
@@ -1261,7 +1281,7 @@ local function finish_genome()
 
     -- Calculate fitness.
 
-    local fitness = rightmost * 4 - (tick / 4) + 1000;
+    local fitness = rightmost - tick / 2;
     if fitness == 0 then
         fitness = -1;
     end
@@ -1409,7 +1429,7 @@ local function save_pool()
 end
 
 local function load_pool()
-    local fname = forms.getfname(form_filename);
+    local fname = forms.gettext(form_filename);
     load_pool_from(fname);
 end
 
