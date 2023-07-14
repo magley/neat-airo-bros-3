@@ -3,6 +3,10 @@
 NEAT Algorithm that plays Super Mario Bros. 3 for the NES.
 Inspired by SethBling.
 
+### Demo:
+
+Check demo.mp4 or click [here](https://www.youtube.com/watch?v=M12Xv0xtWgU).
+
 ### Research info:
 
 **Goal**: Train an agent to complete a single SMB3 level using NEAT.
